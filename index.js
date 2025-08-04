@@ -4,50 +4,76 @@ const port = 8002;
 
 const cors = require('cors');
 require('dotenv').config();
-const mysql = require('mysql');
+const mysql = require('mysql2/promise'); // ZMIANA: mysql2 z promisami
 
 app.use(cors());
 app.use(express.json());
 
-const connection = mysql.createConnection({
+// Połączenie z bazą (pool zamiast pojedynczego connection)
+const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASS,
-  database: process.env.DB_NAME
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-connection.connect(err => {
-  if (err) {
-    console.error('DB connection error:', err.stack);
-    return;
-  }
-  console.log('Connected to MySQL');
-});
+// === POST /submit-votes ===
+// Przyjmuje token, poll_id i pakiet głosów: [{question_poll_id, option_id}]
+app.post('/submit-votes', async (req, res) => {
+  const { token, poll_id, votes } = req.body;
 
-// === POST /submit-vote ===
-// Przyjmuje: question_poll_id, option_id, token, vote_time (opcjonalnie)
-app.post('/submit-vote', (req, res) => {
-  const { question_poll_id, option_id, token, vote_time } = req.body;
-
-  if (!question_poll_id || !option_id || !token) {
-    return res.status(400).json({ error: 'Missing required fields' });
+  if (!token || !poll_id || !Array.isArray(votes) || votes.length === 0) {
+    return res.status(400).json({ error: 'Missing or invalid fields' });
   }
 
-  const query = `
-    INSERT INTO votes (question_poll_id, option_id, token, vote_time)
-    VALUES (?, ?, ?, ?)
-  `;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
 
-  const time = vote_time || new Date(); // Ustaw aktualny czas, jeśli nie podano
+    // 1. Sprawdź token
+    const [rows] = await connection.query(
+      'SELECT * FROM vote_tokens WHERE token = ? AND poll_id = ? AND used = 0',
+      [token, poll_id]
+    );
 
-  connection.query(query, [question_poll_id, option_id, token, time], (err, result) => {
-    if (err) {
-      console.error('Insert vote error:', err);
-      return res.status(500).json({ error: 'Failed to submit vote' });
+    if (rows.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({ error: 'Invalid or already used token' });
     }
 
-    res.status(201).json({ message: 'Vote submitted successfully', voteId: result.insertId });
-  });
+    // 2. Wstaw głosy
+    const now = new Date();
+    for (const vote of votes) {
+      if (!vote.question_poll_id || !vote.option_id) {
+        await connection.rollback();
+        return res.status(400).json({ error: 'Invalid vote object' });
+      }
+
+      await connection.query(
+        'INSERT INTO votes (question_poll_id, option_id, token, vote_time) VALUES (?, ?, ?, ?)',
+        [vote.question_poll_id, vote.option_id, token, now]
+      );
+    }
+
+    // 3. Zaznacz token jako użyty
+    await connection.query(
+      'UPDATE vote_tokens SET used = 1 WHERE token = ?',
+      [token]
+    );
+
+    await connection.commit();
+    res.status(201).json({ message: 'Votes submitted successfully' });
+
+  } catch (err) {
+    console.error('Transaction error:', err);
+    await connection.rollback();
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    connection.release();
+  }
 });
 
 app.listen(port, () => {
